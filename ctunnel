@@ -1,0 +1,112 @@
+#!/bin/bash
+
+CTUNNEL_DIR="$HOME/.ctunnel"
+
+# Ensure config directory exists
+mkdir -p "$CTUNNEL_DIR"
+
+function init_config() {
+  while [[ "$#" -gt 0 ]]; do
+    case $1 in
+      --tunnel) TUNNEL_NAME="$2"; shift ;;
+      --domain) DOMAIN="$2"; shift ;;
+      *) echo "Unknown parameter passed: $1"; exit 1 ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$TUNNEL_NAME" || -z "$DOMAIN" ]]; then
+    echo "Usage: ctunnel init --tunnel <name> --domain <domain>"
+    exit 1
+  fi
+
+  echo "🚧 Creating tunnel '$TUNNEL_NAME'..."
+  cloudflared tunnel create "$TUNNEL_NAME"
+
+  # Get the UUID of the created tunnel
+  UUID=$(cloudflared tunnel list | grep "$TUNNEL_NAME" | awk '{print $1}')
+  if [[ -z "$UUID" ]]; then
+    echo "❌ Failed to find tunnel UUID. Check tunnel list."
+    exit 1
+  fi
+
+  CREDENTIALS_FILE="$HOME/.cloudflared/${UUID}.json"
+
+  echo "🌐 Mapping domain '$DOMAIN' to tunnel..."
+  cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN"
+
+  CTUNNEL_CONFIG_FILE="$CTUNNEL_DIR/${TUNNEL_NAME}.yml"
+  echo "💾 Saving config to $CTUNNEL_CONFIG_FILE..."
+  cat > "$CTUNNEL_CONFIG_FILE" <<EOF
+tunnel: $TUNNEL_NAME
+credentials-file: $CREDENTIALS_FILE
+hostname: $DOMAIN
+EOF
+
+  echo "✅ Tunnel '$TUNNEL_NAME' initialized and config saved."
+}
+
+function start_tunnel() {
+  local PORT=""
+  local NAME="default"
+
+  while [[ "$#" -gt 0 ]]; do
+    case $1 in
+      --name) NAME="$2"; shift ;;
+      *)
+        if [[ -z "$PORT" ]]; then
+          PORT="$1"
+        else
+          echo "Unknown parameter passed: $1"; exit 1
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$PORT" ]]; then
+    echo "Usage: ctunnel http <port> [--name <name>]"
+    exit 1
+  fi
+
+  local CTUNNEL_CONFIG_FILE="$CTUNNEL_DIR/${NAME}.yml"
+
+  if [ ! -f "$CTUNNEL_CONFIG_FILE" ]; then
+    echo "❌ config '$NAME' not found at $CTUNNEL_CONFIG_FILE. Run 'ctunnel init --tunnel $NAME --domain <domain>' first."
+    exit 1
+  fi
+
+  # Read config values
+  TUNNEL_NAME=$(awk -F': ' '/^tunnel:/ {print $2}' "$CTUNNEL_CONFIG_FILE" | xargs)
+  CREDENTIALS_FILE=$(awk -F': ' '/^credentials-file:/ {print $2}' "$CTUNNEL_CONFIG_FILE" | xargs)
+  DOMAIN=$(awk -F': ' '/^hostname:/ {print $2}' "$CTUNNEL_CONFIG_FILE" | xargs)
+
+  TMP_CONFIG="$CTUNNEL_DIR/run-config-${NAME}.yml"
+  cat > "$TMP_CONFIG" <<EOF
+tunnel: $TUNNEL_NAME
+credentials-file: $CREDENTIALS_FILE
+
+ingress:
+  - hostname: $DOMAIN
+    service: http://localhost:$PORT
+  - service: http_status:404
+EOF
+
+  echo "🚀 Starting tunnel '$NAME' to http://localhost:$PORT → https://$DOMAIN"
+  cloudflared tunnel --config "$TMP_CONFIG" run "$TUNNEL_NAME"
+}
+
+# Command dispatcher
+case "$1" in
+  init) shift; init_config "$@" ;;
+  http)
+    shift
+    start_tunnel "$@"
+    ;;
+  *)
+    echo "Usage:"
+    echo "  ctunnel init --tunnel <name> --domain <your.domain.com>"
+    echo "  ctunnel http <port> [--name <name>]"
+    exit 1
+    ;;
+esac
